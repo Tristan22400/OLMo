@@ -1733,8 +1733,12 @@ class OLMo(nn.Module):
         if self.__num_fwd_flops:
             return self.__num_fwd_flops
 
+        # For MoE models, only top_k experts are active per token, so we count
+        # only the active parameters. For dense models this has no effect.
+        is_moe = self.config.block_type == BlockType.moe
+
         # embedding table is just a lookup in the forward pass
-        n_params = self.num_params(include_embedding=False)
+        n_params = self.num_params(include_embedding=False, include_inactive_params=not is_moe)
         # the number of parameters is approximately the number of multiply-accumulates (MAC) in the network
         # each MAC has 2 FLOPs - we multiply by 2 ie 2 * n_param
         # this gets us FLOPs / token
@@ -1751,7 +1755,9 @@ class OLMo(nn.Module):
         if self.__num_bck_flops:
             return self.__num_bck_flops
 
-        n_params = self.num_params()
+        is_moe = self.config.block_type == BlockType.moe
+
+        n_params = self.num_params(include_inactive_params=not is_moe)
         params_flops_per_token = 4 * n_params
         attn_flops_per_token = self.config.n_layers * 8 * (self.config.d_model * self.config.max_sequence_length)
         self.__num_bck_flops = params_flops_per_token + attn_flops_per_token
