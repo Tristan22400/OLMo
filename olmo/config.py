@@ -513,6 +513,33 @@ class ModelConfig(BaseConfig):
     The capacity factor to use in the MoE block. Only applies if not using dMoE.
     """
 
+    moe_routing_type: Optional[str] = "learned"
+    """
+    Routing strategy for MoE layers:
+      - ``"learned"``: Standard learned router with auxiliary load balancing loss.
+      - ``"loss_free"``: Auxiliary-loss-free router with dynamic additive bias
+        (Wang et al., 2024). Eliminates interference gradients from load balancing.
+      - ``"random"``: Uniform random token-to-expert assignment (ablation baseline).
+    """
+
+    moe_bias_update_speed: Optional[float] = None
+    """
+    Step size for the loss-free bias update rule. Defaults to ``0.01 / moe_num_experts``
+    when ``None``. Only used when ``moe_routing_type == "loss_free"``.
+    """
+
+    moe_load_ema_decay: Optional[float] = 0.99
+    """
+    EMA decay for smoothing per-expert load fractions in loss-free routing.
+    Effective window is ~1/(1 - decay) steps. Only used when ``moe_routing_type == "loss_free"``.
+    """
+
+    moe_max_bias: Optional[float] = 10.0
+    """
+    Hard clamp on the loss-free routing bias magnitude. Prevents unbounded growth
+    in pathological cases. Only used when ``moe_routing_type == "loss_free"``.
+    """
+
     scale_emb_init: bool = False
     """
     If ``True``, embeddings are scaled up by ``sqrt(d_model)`` during initialization.
@@ -1372,8 +1399,16 @@ def config_to_moe_args(config: ModelConfig) -> Dict[str, Any]:
         "return_bias": False,
         "shared_expert": config.moe_shared_expert,
         "moe_lbl_in_fp32": config.moe_lbl_in_fp32,
+        "moe_routing_type": config.moe_routing_type,
     }
     if config.moe_zloss_weight:
         kwargs["moe_zloss_weight"] = config.moe_zloss_weight
+
+    # Loss-free routing hyperparameters.
+    if config.moe_routing_type == "loss_free":
+        if config.moe_bias_update_speed is not None:
+            kwargs["moe_bias_update_speed"] = config.moe_bias_update_speed
+        kwargs["moe_load_ema_decay"] = config.moe_load_ema_decay
+        kwargs["moe_max_bias"] = config.moe_max_bias
 
     return MoEArgs(**kwargs)

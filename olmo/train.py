@@ -856,25 +856,44 @@ class Trainer:
                         z_batch_loss += z_loss.detach()
 
                 if self.model.config.block_type == BlockType.moe:
-                    if self.model.config.moe_zloss_weight:
-                        lb_loss, moe_z_loss = batched_load_balancing_loss(self.moe_args)
-                        lb_loss = lb_loss / len(micro_batches)
-                        moe_z_loss = moe_z_loss / len(micro_batches)
-                    elif self.model.config.moe_loss_weight:
-                        lb_loss = batched_load_balancing_loss(self.moe_args) / len(micro_batches)
-                    if self.model.config.moe_log_expert_assignment:
+                    routing_type = getattr(self.model.config, 'moe_routing_type', 'learned')
+
+                    if routing_type == 'random':
+                        # Random routing: no auxiliary losses, no routing stats.
+                        pass
+                    else:
+                        # Both 'learned' and 'loss_free' save routing stats via
+                        # save_load_balancing_loss() in megablocks.
                         if self.model.config.moe_zloss_weight:
-                            tokens_per_expert, _, _ = zip(*get_load_balancing_loss())
-                        else:
-                            tokens_per_expert, _ = zip(*get_load_balancing_loss())
-                        expert_assignments += torch.stack(tokens_per_expert, dim=0)
-                    clear_load_balancing_loss()
-                    if self.model.config.moe_loss_weight:
-                        loss += lb_loss
-                        lb_batch_loss += lb_loss.detach()
-                    if self.model.config.moe_zloss_weight:
-                        loss += moe_z_loss
-                        moe_z_batch_loss += moe_z_loss.detach()
+                            lb_loss, moe_z_loss = batched_load_balancing_loss(self.moe_args)
+                            lb_loss = lb_loss / len(micro_batches)
+                            moe_z_loss = moe_z_loss / len(micro_batches)
+                        elif self.model.config.moe_loss_weight:
+                            lb_loss = batched_load_balancing_loss(self.moe_args) / len(micro_batches)
+
+                        if self.model.config.moe_log_expert_assignment:
+                            if self.model.config.moe_zloss_weight:
+                                tokens_per_expert, _, _ = zip(*get_load_balancing_loss())
+                            else:
+                                tokens_per_expert, _ = zip(*get_load_balancing_loss())
+                            expert_assignments += torch.stack(tokens_per_expert, dim=0)
+
+                        clear_load_balancing_loss()
+
+                        # LB loss: only added for 'learned' routing. For 'loss_free',
+                        # the LB loss is computed (needed for stats) but NOT added to
+                        # the training objective — this is the core mechanism that
+                        # eliminates interference gradients.
+                        if self.model.config.moe_loss_weight and routing_type == 'learned':
+                            loss += lb_loss
+                            lb_batch_loss += lb_loss.detach()
+
+                        # Z-loss: added for both 'learned' and 'loss_free'. It
+                        # regularizes router logit magnitudes and implicitly bounds
+                        # the loss-free bias via logit scale control.
+                        if self.model.config.moe_zloss_weight:
+                            loss += moe_z_loss
+                            moe_z_batch_loss += moe_z_loss.detach()
 
                 # Run backward pass.
                 loss.backward()
