@@ -84,6 +84,49 @@ __all__ = ["SpeedMonitor", "LRMonitor", "Trainer"]
 log = logging.getLogger(__name__)
 
 
+# GPU peak FLOPS (bf16/fp16) lookup table for MFU computation.
+# Values are in TFLOPS (1e12 FLOPS). Sources: NVIDIA spec sheets.
+_GPU_PEAK_TFLOPS: Dict[str, float] = {
+    # Consumer / Kaggle GPUs
+    "Tesla T4": 65.0,           # FP16 Tensor Core
+    "Tesla P100-PCIE-16GB": 21.2,  # FP16
+    "Tesla P100-SXE-16GB": 21.2,
+    "Tesla V100-SXE-16GB": 125.0,  # FP16 Tensor Core
+    "Tesla V100-SXE-32GB": 125.0,
+    "Tesla V100-PCIE-16GB": 112.0,
+    "Tesla V100-PCIE-32GB": 112.0,
+    # Data center GPUs
+    "NVIDIA A100-SXM4-40GB": 312.0,  # bf16 Tensor Core
+    "NVIDIA A100-SXM4-80GB": 312.0,
+    "NVIDIA A100-PCIE-40GB": 312.0,
+    "NVIDIA A100-PCIE-80GB": 312.0,
+    "NVIDIA A100 80GB PCIe": 312.0,
+    "NVIDIA H100 80GB HBM3": 989.0,  # bf16 Tensor Core
+    "NVIDIA H100 PCIe": 756.0,
+    "NVIDIA H100-SXM5-80GB": 989.0,
+    "NVIDIA L4": 121.0,
+    "NVIDIA L40": 181.0,
+    "NVIDIA L40S": 362.0,
+    # Consumer GPUs (for local testing)
+    "NVIDIA GeForce RTX 3090": 71.0,
+    "NVIDIA GeForce RTX 4090": 165.0,
+}
+
+
+def _get_gpu_peak_tflops() -> Optional[float]:
+    """Auto-detect GPU peak TFLOPS from CUDA device name."""
+    if not torch.cuda.is_available():
+        return None
+    gpu_name = torch.cuda.get_device_name(0)
+    # Try exact match first, then substring match.
+    if gpu_name in _GPU_PEAK_TFLOPS:
+        return _GPU_PEAK_TFLOPS[gpu_name]
+    for key, val in _GPU_PEAK_TFLOPS.items():
+        if key in gpu_name or gpu_name in key:
+            return val
+    return None
+
+
 @dataclass
 class SpeedMonitor:
     cfg: SpeedMonitorConfig
@@ -91,6 +134,11 @@ class SpeedMonitor:
     global_total_tokens: int = 0
     total_training_Gflops: float = 0
     device_interval_tokens: Deque[int] = field(default_factory=lambda: deque([]))
+    flops_per_token: int = 0
+    gpu_peak_tflops: Optional[float] = field(default=None, init=False)
+
+    def __post_init__(self):
+        self.gpu_peak_tflops = _get_gpu_peak_tflops()
 
     def batch_start(
         self,
@@ -101,9 +149,10 @@ class SpeedMonitor:
         record: bool = True,
     ) -> None:
         self.global_total_tokens = global_total_tokens
+        self.flops_per_token = num_fwd_flops + num_bck_flops
         # num_fwd_flops and num_bck_flops from the OLMo model computes flops per token
         # converting to GFLOPs here prevents numerical issues while logging
-        self.total_training_Gflops = (num_fwd_flops + num_bck_flops) * global_total_tokens / 1e9
+        self.total_training_Gflops = self.flops_per_token * global_total_tokens / 1e9
 
         if record:
             if len(self.start_times) >= self.cfg.window_size:
@@ -127,8 +176,16 @@ class SpeedMonitor:
             interval_seconds = time.monotonic() - self.start_times[0]
             interval_batches = len(self.start_times)
             interval_tokens = sum(self.device_interval_tokens)
-            metrics["throughput/device/tokens_per_second"] = interval_tokens / interval_seconds
+            tokens_per_second = interval_tokens / interval_seconds
+            metrics["throughput/device/tokens_per_second"] = tokens_per_second
             metrics["throughput/device/batches_per_second"] = interval_batches / interval_seconds
+
+            # MFU: Model FLOPS Utilization = achieved FLOPS / GPU peak FLOPS.
+            if self.flops_per_token > 0:
+                device_tflops = self.flops_per_token * tokens_per_second / 1e12
+                metrics["throughput/device/TFLOPS"] = device_tflops
+                if self.gpu_peak_tflops is not None:
+                    metrics["throughput/device/MFU"] = device_tflops / self.gpu_peak_tflops
         return metrics
 
 
