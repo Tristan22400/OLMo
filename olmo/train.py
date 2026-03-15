@@ -949,6 +949,8 @@ class Trainer:
                         # regularizes router logit magnitudes and implicitly bounds
                         # the loss-free bias via logit scale control.
                         if self.model.config.moe_zloss_weight:
+                            if isinstance(moe_z_loss, float):
+                                moe_z_loss = torch.tensor(moe_z_loss, device=self.device)
                             loss += moe_z_loss
                             moe_z_batch_loss += moe_z_loss.detach()
 
