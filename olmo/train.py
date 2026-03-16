@@ -323,9 +323,6 @@ class Trainer:
 
             self.moe_args = config_to_moe_args(self.cfg.model)
 
-            # MaxVio rolling average buffer (last 100 steps)
-            from collections import deque
-            self._maxvio_avg_history: deque = deque(maxlen=100)
 
     @property
     def dataset(self) -> IterableDataset:
@@ -1048,31 +1045,33 @@ class Trainer:
             metrics["train/LoadBalancingLoss"] = lb_batch_loss.item()
             # Log assignment metrics.
             if expert_assignments is not None:
-                for layer_idx, expert_assignments_layer in enumerate(expert_assignments):
-                    total_tokens = expert_assignments_layer.sum().item()
-                    for expert_idx, expert_assignment in enumerate(expert_assignments_layer):
+                # Move to CPU once to avoid per-element CUDA syncs.
+                ea_cpu = expert_assignments.cpu()  # (n_layers, n_experts)
+
+                for layer_idx in range(ea_cpu.shape[0]):
+                    layer_load = ea_cpu[layer_idx]
+                    total_tokens = layer_load.sum().item()
+                    for expert_idx in range(layer_load.shape[0]):
+                        tokens = layer_load[expert_idx].item()
                         metrics[f"train/TokensPercentage/layer{layer_idx}/expert{expert_idx}"] = (
-                            expert_assignment.item() / total_tokens
+                            tokens / total_tokens
                         ) * 100
                         metrics[
                             f"train/TokensTotal/layer{layer_idx}/expert{expert_idx}"
-                        ] = expert_assignment.item()
+                        ] = tokens
 
                 # ── MaxVio_batch per MoE layer (Wang et al., 2024, §4.1) ─────
                 # MaxVio = (max_i(Load_i) - expected_load) / expected_load
                 # where expected_load = total_tokens_routed / num_experts.
-                # Since megablocks histogram always produces a fixed-length
-                # vector (num_experts entries, zeros for dead experts),
-                # load.mean() == load.sum()/num_experts == expected_load.
-                per_layer_maxvio = []
-                for layer_idx in range(expert_assignments.shape[0]):
-                    load = expert_assignments[layer_idx]  # (n_experts,)
-                    expected_load = load.sum() / load.shape[0]  # total_tokens / num_experts
-                    if expected_load > 0:
-                        maxvio = (load.max() - expected_load) / expected_load
-                        per_layer_maxvio.append(maxvio.item())
-                    else:
-                        per_layer_maxvio.append(0.0)
+                # By pigeonhole, MaxVio >= 0 always. Guard is only for T=0.
+                ea_float = ea_cpu.float()
+                expected = ea_float.mean(dim=1)  # (n_layers,)
+                max_load = ea_float.max(dim=1).values
+                per_layer_maxvio = torch.where(
+                    expected > 0,
+                    (max_load - expected) / expected,
+                    torch.zeros_like(expected),
+                ).tolist()
 
                 maxvio_avg = sum(per_layer_maxvio) / len(per_layer_maxvio)
                 maxvio_max = max(per_layer_maxvio)
@@ -1081,12 +1080,6 @@ class Trainer:
                 metrics["load_balance/maxvio_batch_avg"] = maxvio_avg
                 metrics["load_balance/maxvio_batch_max"] = maxvio_max
                 metrics["load_balance/maxvio_batch_min"] = maxvio_min
-
-                # Rolling average over last 100 steps
-                self._maxvio_avg_history.append(maxvio_avg)
-                metrics["load_balance/maxvio_batch_avg_smoothed"] = (
-                    sum(self._maxvio_avg_history) / len(self._maxvio_avg_history)
-                )
 
                 # Per-layer details every 500 steps
                 if self.global_step % 500 == 0:
