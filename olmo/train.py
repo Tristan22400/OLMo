@@ -323,6 +323,10 @@ class Trainer:
 
             self.moe_args = config_to_moe_args(self.cfg.model)
 
+            # MaxVio rolling average buffer (last 100 steps)
+            from collections import deque
+            self._maxvio_avg_history: deque = deque(maxlen=100)
+
     @property
     def dataset(self) -> IterableDataset:
         assert isinstance(self.train_loader.dataset, IterableDataset)
@@ -1053,6 +1057,47 @@ class Trainer:
                         metrics[
                             f"train/TokensTotal/layer{layer_idx}/expert{expert_idx}"
                         ] = expert_assignment.item()
+
+                # ── MaxVio_batch per MoE layer (Wang et al., 2024, §4.1) ─────
+                # MaxVio = (max_i(Load_i) - expected_load) / expected_load
+                # where expected_load = total_tokens_routed / num_experts.
+                # Since megablocks histogram always produces a fixed-length
+                # vector (num_experts entries, zeros for dead experts),
+                # load.mean() == load.sum()/num_experts == expected_load.
+                per_layer_maxvio = []
+                for layer_idx in range(expert_assignments.shape[0]):
+                    load = expert_assignments[layer_idx]  # (n_experts,)
+                    expected_load = load.sum() / load.shape[0]  # total_tokens / num_experts
+                    if expected_load > 0:
+                        maxvio = (load.max() - expected_load) / expected_load
+                        per_layer_maxvio.append(maxvio.item())
+                    else:
+                        per_layer_maxvio.append(0.0)
+
+                maxvio_avg = sum(per_layer_maxvio) / len(per_layer_maxvio)
+                maxvio_max = max(per_layer_maxvio)
+                maxvio_min = min(per_layer_maxvio)
+
+                metrics["load_balance/maxvio_batch_avg"] = maxvio_avg
+                metrics["load_balance/maxvio_batch_max"] = maxvio_max
+                metrics["load_balance/maxvio_batch_min"] = maxvio_min
+
+                # Rolling average over last 100 steps
+                self._maxvio_avg_history.append(maxvio_avg)
+                metrics["load_balance/maxvio_batch_avg_smoothed"] = (
+                    sum(self._maxvio_avg_history) / len(self._maxvio_avg_history)
+                )
+
+                # Per-layer details every 500 steps
+                if self.global_step % 500 == 0:
+                    for layer_idx, mv in enumerate(per_layer_maxvio):
+                        metrics[f"load_balance/maxvio_batch_layer_{layer_idx}"] = mv
+                    if wandb.run is not None:
+                        wandb.log(
+                            {"load_balance/maxvio_per_layer_hist": wandb.Histogram(per_layer_maxvio)},
+                            step=self.global_step,
+                        )
+
         if moe_z_batch_loss is not None:
             metrics["train/MoEZLoss"] = moe_z_batch_loss.item()
 
