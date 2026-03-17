@@ -1054,8 +1054,8 @@ class Trainer:
                     for expert_idx in range(layer_load.shape[0]):
                         tokens = layer_load[expert_idx].item()
                         metrics[f"train/TokensPercentage/layer{layer_idx}/expert{expert_idx}"] = (
-                            tokens / total_tokens
-                        ) * 100
+                            (tokens / total_tokens) * 100 if total_tokens > 0 else 0.0
+                        )
                         metrics[
                             f"train/TokensTotal/layer{layer_idx}/expert{expert_idx}"
                         ] = tokens
