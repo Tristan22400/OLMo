@@ -522,6 +522,13 @@ class ModelConfig(BaseConfig):
       - ``"random"``: Uniform random token-to-expert assignment (ablation baseline).
     """
 
+    moe_gate_type: str = "softmax"
+    """
+    Gate function for MoE routing: ``"softmax"`` or ``"sigmoid"``.
+    Softmax: experts compete (scores sum to 1). Sigmoid: independent gates.
+    Affects both score computation and bias update rule (Wang et al., 2024).
+    """
+
     moe_bias_update_speed: Optional[float] = None
     """
     Step size u for the loss-free bias update (Algorithm 1, Wang et al. 2024).
@@ -1395,6 +1402,7 @@ def config_to_moe_args(config: ModelConfig) -> Dict[str, Any]:
 
     # Loss-free routing hyperparameters.
     if config.moe_routing_type == "loss_free":
+        kwargs["moe_gate_type"] = config.moe_gate_type
         if config.moe_bias_update_speed is not None:
             kwargs["moe_bias_update_speed"] = config.moe_bias_update_speed
 
