@@ -524,20 +524,9 @@ class ModelConfig(BaseConfig):
 
     moe_bias_update_speed: Optional[float] = None
     """
-    Step size for the loss-free bias update rule. Defaults to ``0.01 / moe_num_experts``
-    when ``None``. Only used when ``moe_routing_type == "loss_free"``.
-    """
-
-    moe_load_ema_decay: Optional[float] = 0.99
-    """
-    EMA decay for smoothing per-expert load fractions in loss-free routing.
-    Effective window is ~1/(1 - decay) steps. Only used when ``moe_routing_type == "loss_free"``.
-    """
-
-    moe_max_bias: Optional[float] = 10.0
-    """
-    Hard clamp on the loss-free routing bias magnitude. Prevents unbounded growth
-    in pathological cases. Only used when ``moe_routing_type == "loss_free"``.
+    Step size u for the loss-free bias update (Algorithm 1, Wang et al. 2024).
+    Paper optimal: u = 0.001. Defaults to 0.001 in megablocks when ``None``.
+    Only used when ``moe_routing_type == "loss_free"``.
     """
 
     scale_emb_init: bool = False
@@ -1408,7 +1397,5 @@ def config_to_moe_args(config: ModelConfig) -> Dict[str, Any]:
     if config.moe_routing_type == "loss_free":
         if config.moe_bias_update_speed is not None:
             kwargs["moe_bias_update_speed"] = config.moe_bias_update_speed
-        kwargs["moe_load_ema_decay"] = config.moe_load_ema_decay
-        kwargs["moe_max_bias"] = config.moe_max_bias
 
     return MoEArgs(**kwargs)
