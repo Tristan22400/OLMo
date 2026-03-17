@@ -922,12 +922,20 @@ class Trainer:
                     else:
                         # Both 'learned' and 'loss_free' save routing stats via
                         # save_load_balancing_loss() in megablocks.
+                        import time as _time
+                        torch.cuda.synchronize()
+                        _lb_t0 = _time.perf_counter()
                         if self.model.config.moe_zloss_weight:
                             lb_loss, moe_z_loss = batched_load_balancing_loss(self.moe_args)
                             lb_loss = lb_loss / len(micro_batches)
                             moe_z_loss = moe_z_loss / len(micro_batches)
                         elif self.model.config.moe_loss_weight:
                             lb_loss = batched_load_balancing_loss(self.moe_args) / len(micro_batches)
+                        torch.cuda.synchronize()
+                        _lb_t1 = _time.perf_counter()
+                        if not hasattr(self, '_lb_loss_time_ms'):
+                            self._lb_loss_time_ms = 0.0
+                        self._lb_loss_time_ms += (_lb_t1 - _lb_t0) * 1000
 
                         if self.model.config.moe_log_expert_assignment:
                             if self.model.config.moe_zloss_weight:
@@ -981,6 +989,18 @@ class Trainer:
 
         # Move tensors to the right device.
         batch = move_to_device(batch, self.device)
+
+        # Enable update_bias profiling on MoE routers.
+        _profile_routers = []
+        if self.model.config.block_type == BlockType.moe:
+            for block in self.model.transformer.blocks:  # type: ignore[union-attr]
+                router = getattr(getattr(block, 'ffn', None), 'router', None)
+                if router is not None and hasattr(router, '_profile_update_bias'):
+                    router._profile_update_bias = True
+                    _profile_routers.append(router)
+
+        # Reset per-step accumulator for LB loss timing.
+        self._lb_loss_time_ms = 0.0
 
         # Run forward-backward pass.
         ce_batch_loss, z_batch_loss, lb_batch_loss, moe_z_batch_loss, expert_assignments = self.train_batch(batch)
@@ -1093,6 +1113,17 @@ class Trainer:
 
         if moe_z_batch_loss is not None:
             metrics["train/MoEZLoss"] = moe_z_batch_loss.item()
+
+        # Profiling: update_bias and LB loss timing.
+        if _profile_routers:
+            total_bias_ms = sum(r._last_update_bias_ms for r in _profile_routers)
+            metrics["profile/update_bias_total_ms"] = total_bias_ms
+            metrics["profile/update_bias_per_layer_ms"] = total_bias_ms / len(_profile_routers)
+            # Disable profiling after collecting.
+            for r in _profile_routers:
+                r._profile_update_bias = False
+        if hasattr(self, '_lb_loss_time_ms') and self._lb_loss_time_ms > 0:
+            metrics["profile/lb_loss_compute_ms"] = self._lb_loss_time_ms
 
         # Maybe collect post-step optimizer-specific metrics.
         if should_log_optim_metrics_this_step:
