@@ -916,16 +916,8 @@ class Trainer:
                 if self.model.config.block_type == BlockType.moe:
                     routing_type = getattr(self.model.config, 'moe_routing_type', 'learned')
 
-                    if routing_type == 'random':
-                        # Random routing: no auxiliary losses, but collect
-                        # expert assignment stats for MaxVio / token logging.
-                        if self.model.config.moe_log_expert_assignment:
-                            tokens_per_expert, _, _ = zip(*get_load_balancing_loss())
-                            expert_assignments += torch.stack(tokens_per_expert, dim=0)
-                        clear_load_balancing_loss()
-                    else:
-                        # Both 'learned' and 'loss_free' save routing stats via
-                        # save_load_balancing_loss() in megablocks.
+                    if routing_type != 'random':
+                        # Compute LB loss and z-loss for learned/loss_free routing.
                         import time as _time
                         torch.cuda.synchronize()
                         _lb_t0 = _time.perf_counter()
@@ -941,28 +933,23 @@ class Trainer:
                             self._lb_loss_time_ms = 0.0
                         self._lb_loss_time_ms += (_lb_t1 - _lb_t0) * 1000
 
-                        if self.model.config.moe_log_expert_assignment:
-                            tokens_per_expert, _, _ = zip(*get_load_balancing_loss())
-                            expert_assignments += torch.stack(tokens_per_expert, dim=0)
-
-                        clear_load_balancing_loss()
-
-                        # LB loss: only added for 'learned' routing. For 'loss_free',
-                        # the LB loss is computed (needed for stats) but NOT added to
-                        # the training objective — this is the core mechanism that
-                        # eliminates interference gradients.
+                        # LB loss: only added for 'learned' routing.
                         if self.model.config.moe_loss_weight and routing_type == 'learned':
                             loss += lb_loss
                             lb_batch_loss += lb_loss.detach()
 
-                        # Z-loss: added for both 'learned' and 'loss_free'. It
-                        # regularizes router logit magnitudes and implicitly bounds
-                        # the loss-free bias via logit scale control.
+                        # Z-loss: added for both 'learned' and 'loss_free'.
                         if self.model.config.moe_zloss_weight:
                             if isinstance(moe_z_loss, float):
                                 moe_z_loss = torch.tensor(moe_z_loss, device=self.device)
                             loss += moe_z_loss
                             moe_z_batch_loss += moe_z_loss.detach()
+
+                    # Expert assignment logging (all routing types).
+                    if self.model.config.moe_log_expert_assignment:
+                        tokens_per_expert, _, _ = zip(*get_load_balancing_loss())
+                        expert_assignments += torch.stack(tokens_per_expert, dim=0)
+                    clear_load_balancing_loss()
 
                 # Run backward pass.
                 loss.backward()
@@ -1115,19 +1102,12 @@ class Trainer:
         if moe_z_batch_loss is not None:
             metrics["train/MoEZLoss"] = moe_z_batch_loss.item()
 
-        # Profiling: update_bias and LB loss timing.
+        # Profiling and router diagnostics (loss_free routing only).
         if _profile_routers:
             total_bias_ms = sum(r._last_update_bias_ms for r in _profile_routers)
             metrics["profile/update_bias_total_ms"] = total_bias_ms
             metrics["profile/update_bias_per_layer_ms"] = total_bias_ms / len(_profile_routers)
-            # Disable profiling after collecting.
-            for r in _profile_routers:
-                r._profile_update_bias = False
-        if hasattr(self, '_lb_loss_time_ms') and self._lb_loss_time_ms > 0:
-            metrics["profile/lb_loss_compute_ms"] = self._lb_loss_time_ms
-
-        # ── Router diagnostics ───────────────────────────────────────────
-        if _profile_routers:
+            # Router weight/bias diagnostics.
             w_norms = [r.layer.weight.data.norm().item() for r in _profile_routers]
             bias_maxs = [r.expert_bias.abs().max().item() for r in _profile_routers]
             bias_spreads = [r.expert_bias.std().item() for r in _profile_routers]
@@ -1135,6 +1115,11 @@ class Trainer:
             metrics["router/weight_norm_mean"] = sum(w_norms) / len(w_norms)
             metrics["router/bias_abs_max"] = max(bias_maxs)
             metrics["router/bias_spread_max"] = max(bias_spreads)
+            # Disable profiling after collecting.
+            for r in _profile_routers:
+                r._profile_update_bias = False
+        if hasattr(self, '_lb_loss_time_ms') and self._lb_loss_time_ms > 0:
+            metrics["profile/lb_loss_compute_ms"] = self._lb_loss_time_ms
 
         # Warn on non-finite metrics.
         for name, value in metrics.items():
