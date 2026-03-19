@@ -1046,7 +1046,10 @@ class Trainer:
         self.cur_train_loss = ce_batch_loss.item()
         self.min_train_loss = min(self.min_train_loss, self.cur_train_loss)
         metrics["train/CrossEntropyLoss"] = self.cur_train_loss
-        metrics["train/Perplexity"] = math.exp(self.cur_train_loss)
+        try:
+            metrics["train/Perplexity"] = math.exp(self.cur_train_loss)
+        except OverflowError:
+            metrics["train/Perplexity"] = float("inf")
         if z_batch_loss is not None:
             metrics["train/ZLoss"] = z_batch_loss.item()
         if lb_batch_loss is not None:
