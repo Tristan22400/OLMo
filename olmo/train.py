@@ -917,8 +917,12 @@ class Trainer:
                     routing_type = getattr(self.model.config, 'moe_routing_type', 'learned')
 
                     if routing_type == 'random':
-                        # Random routing: no auxiliary losses, no routing stats.
-                        pass
+                        # Random routing: no auxiliary losses, but collect
+                        # expert assignment stats for MaxVio / token logging.
+                        if self.model.config.moe_log_expert_assignment:
+                            tokens_per_expert, _, _ = zip(*get_load_balancing_loss())
+                            expert_assignments += torch.stack(tokens_per_expert, dim=0)
+                        clear_load_balancing_loss()
                     else:
                         # Both 'learned' and 'loss_free' save routing stats via
                         # save_load_balancing_loss() in megablocks.
@@ -938,10 +942,7 @@ class Trainer:
                         self._lb_loss_time_ms += (_lb_t1 - _lb_t0) * 1000
 
                         if self.model.config.moe_log_expert_assignment:
-                            if self.model.config.moe_zloss_weight:
-                                tokens_per_expert, _, _ = zip(*get_load_balancing_loss())
-                            else:
-                                tokens_per_expert, _ = zip(*get_load_balancing_loss())
+                            tokens_per_expert, _, _ = zip(*get_load_balancing_loss())
                             expert_assignments += torch.stack(tokens_per_expert, dim=0)
 
                         clear_load_balancing_loss()
@@ -1125,6 +1126,21 @@ class Trainer:
         if hasattr(self, '_lb_loss_time_ms') and self._lb_loss_time_ms > 0:
             metrics["profile/lb_loss_compute_ms"] = self._lb_loss_time_ms
 
+        # ── Router diagnostics ───────────────────────────────────────────
+        if _profile_routers:
+            w_norms = [r.layer.weight.data.norm().item() for r in _profile_routers]
+            bias_maxs = [r.expert_bias.abs().max().item() for r in _profile_routers]
+            bias_spreads = [r.expert_bias.std().item() for r in _profile_routers]
+            metrics["router/weight_norm_max"] = max(w_norms)
+            metrics["router/weight_norm_mean"] = sum(w_norms) / len(w_norms)
+            metrics["router/bias_abs_max"] = max(bias_maxs)
+            metrics["router/bias_spread_max"] = max(bias_spreads)
+
+        # Warn on non-finite metrics.
+        for name, value in metrics.items():
+            if not math.isfinite(value):
+                log.warning(f"Non-finite metric at step {self.global_step}: {name}={value}")
+
         # Maybe collect post-step optimizer-specific metrics.
         if should_log_optim_metrics_this_step:
             optim_metrics = self.optim.get_post_step_metrics(
@@ -1187,7 +1203,9 @@ class Trainer:
 
     def log_metrics_to_console(self, prefix: str, metrics: Dict[str, float]):
         def format_float(value: float) -> str:
-            if value < 0.0001:
+            if not math.isfinite(value):
+                return str(value)
+            elif value < 0.0001:
                 return str(value)  # scientific notation
             elif value > 1000:
                 return f"{int(value):,d}"
