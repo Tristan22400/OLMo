@@ -74,6 +74,7 @@ try:
     from megablocks.layers.moe import (
         batched_load_balancing_loss,
         clear_load_balancing_loss,
+        flush_loss_free_bias_updates,
         get_load_balancing_loss,
     )
 except ImportError:
@@ -970,30 +971,11 @@ class Trainer:
         # Move tensors to the right device.
         batch = move_to_device(batch, self.device)
 
-        # Collect loss-free routers for batched bias update.
-        _loss_free_routers = []
-        if self.model.config.block_type == BlockType.moe:
-            for block in self.model.transformer.blocks:  # type: ignore[union-attr]
-                router = getattr(getattr(block, 'ffn', None), 'router', None)
-                if router is not None and hasattr(router, 'update_bias_local'):
-                    _loss_free_routers.append(router)
-
         # Run forward-backward pass.
         ce_batch_loss, z_batch_loss, lb_batch_loss, moe_z_batch_loss, expert_assignments = self.train_batch(batch)
 
-        # Batched bias update: single all-reduce for all layers instead of one
-        # per layer.  Each router stashed its tokens_per_expert in
-        # `_pending_tokens` during the forward pass.
-        if _loss_free_routers:
-            pending = [r._pending_tokens for r in _loss_free_routers
-                       if hasattr(r, '_pending_tokens')]
-            if pending:
-                stacked = torch.stack(pending)  # (n_layers, n_experts)
-                if dist.is_initialized() and dist.get_world_size() > 1:
-                    dist.all_reduce(stacked, op=dist.ReduceOp.SUM)
-                for router, reduced_tokens in zip(_loss_free_routers, stacked):
-                    router.update_bias_local(reduced_tokens)
-                    del router._pending_tokens
+        # Flush loss-free bias updates (single all-reduce for all layers).
+        flush_loss_free_bias_updates()
 
         # Collect loss, potentially reducing over all ranks.
         if reduce_global_loss:
@@ -1108,14 +1090,20 @@ class Trainer:
             metrics["train/MoEZLoss"] = moe_z_batch_loss.item()
 
         # Router diagnostics (loss_free routing only).
-        if _loss_free_routers:
-            w_norms = [r.layer.weight.data.norm().item() for r in _loss_free_routers]
-            bias_maxs = [r.expert_bias.abs().max().item() for r in _loss_free_routers]
-            bias_spreads = [r.expert_bias.std().item() for r in _loss_free_routers]
-            metrics["router/weight_norm_max"] = max(w_norms)
-            metrics["router/weight_norm_mean"] = sum(w_norms) / len(w_norms)
-            metrics["router/bias_abs_max"] = max(bias_maxs)
-            metrics["router/bias_spread_max"] = max(bias_spreads)
+        if self.model.config.block_type == BlockType.moe:
+            _lf_routers = [
+                getattr(getattr(b, 'ffn', None), 'router', None)
+                for b in self.model.transformer.blocks  # type: ignore[union-attr]
+            ]
+            _lf_routers = [r for r in _lf_routers if r is not None and hasattr(r, 'expert_bias')]
+            if _lf_routers:
+                w_norms = [r.layer.weight.data.norm().item() for r in _lf_routers]
+                bias_maxs = [r.expert_bias.abs().max().item() for r in _lf_routers]
+                bias_spreads = [r.expert_bias.std().item() for r in _lf_routers]
+                metrics["router/weight_norm_max"] = max(w_norms)
+                metrics["router/weight_norm_mean"] = sum(w_norms) / len(w_norms)
+                metrics["router/bias_abs_max"] = max(bias_maxs)
+                metrics["router/bias_spread_max"] = max(bias_spreads)
 
         # Warn on non-finite metrics.
         for name, value in metrics.items():
